@@ -1,0 +1,133 @@
+
+async function processTranscription(videoId, videoPath) {
+  const job = transcriptionJobs.get(videoId);
+
+  if (!job) return;
+
+  const workDir = path.join(tempDir, videoId);
+  const outputPattern = path.join(workDir, "parte-%05d.mp3");
+
+  const resultPath = path.join(
+    uploadDir,
+    `${videoId}.transcription.json`
+  );
+
+  const pythonOutputPath = path.join(workDir, "resultado.json");
+
+  fs.mkdirSync(workDir, { recursive: true });
+
+  try {
+    job.status = "extracting";
+    job.progress = 5;
+    job.message = "Extraindo áudio do vídeo.";
+
+    console.log(`Extraindo áudio: ${videoId}`);
+
+    await extractAudio(videoPath, outputPattern);
+
+    const chunks = fs.readdirSync(workDir)
+      .filter((file) => /^parte-\d+\.mp3$/i.test(file))
+      .sort();
+
+    if (chunks.length === 0) {
+      throw new Error("Nenhum áudio foi extraído do vídeo.");
+    }
+
+    for (const chunk of chunks) {
+      const chunkPath = path.join(workDir, chunk);
+      const chunkStats = fs.statSync(chunkPath);
+
+      if (chunkStats.size > MAX_AUDIO_SIZE) {
+        throw new Error(`A parte ${chunk} ultrapassou 24 MB.`);
+      }
+    }
+
+    job.totalChunks = chunks.length;
+    job.status = "transcribing";
+    job.progress = 10;
+    job.message = "Transcrevendo com Whisper local.";
+
+    console.log("Iniciando Whisper local...");
+
+    const audioPaths = chunks.map((chunk) =>
+      path.join(workDir, chunk)
+    );
+
+    await new Promise((resolve, reject) => {
+      const args = [
+        "-3.12",
+        path.join(__dirname, "../transcribe.py"),
+        pythonOutputPath,
+        ...audioPaths
+      ];
+
+      const pythonProcess = spawn(pythonPath, args);
+
+      let errorOutput = "";
+
+      pythonProcess.stderr.on("data", (data) => {
+        const message = data.toString();
+        errorOutput += message;
+
+        console.log(message.trim());
+      });
+
+      pythonProcess.on("error", reject);
+
+      pythonProcess.on("close", (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(
+            new Error(errorOutput || `Python terminou com código ${code}`)
+          );
+        }
+      });
+    });
+
+    if (!fs.existsSync(pythonOutputPath)) {
+      throw new Error("O Whisper não gerou o arquivo de transcrição.");
+    }
+
+    const transcription = JSON.parse(
+      fs.readFileSync(pythonOutputPath, "utf8")
+    );
+
+    const result = {
+      videoId,
+      status: "completed",
+      model: transcription.model,
+      language: transcription.language,
+      totalChunks: chunks.length,
+      text: transcription.text,
+      segments: transcription.segments,
+      createdAt: new Date().toISOString()
+    };
+
+    fs.writeFileSync(
+      resultPath,
+      JSON.stringify(result, null, 2),
+      "utf8"
+    );
+
+    job.completedChunks = chunks.length;
+    job.progress = 100;
+    job.status = "completed";
+    job.message = "Transcrição concluída!";
+    job.resultPath = resultPath;
+
+    console.log(`Transcrição concluída: ${videoId}`);
+
+  } catch (error) {
+    console.error("Erro na transcrição:", error.message);
+
+    job.status = "error";
+    job.message = error.message;
+
+  } finally {
+    fs.rmSync(workDir, {
+      recursive: true,
+      force: true
+    });
+  }
+}
